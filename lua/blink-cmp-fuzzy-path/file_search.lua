@@ -17,154 +17,233 @@ else
   end
 end
 
-local function command_exists(cmd) return vim.fn.executable(cmd) == 1 end
+---@class blink-cmp-fuzzy-path.Listing
+---@field files string[] Relative to the root, as the tool printed them
+---@field time integer `os.time()` the listing finished
+---@field cut boolean Stopped at `max_files`
+---@field done boolean The listing has answered
+---@field waiting fun(files: string[])[] Called once it is done
 
-local function make_relative_path(filepath, bufpath, search_base)
-  if not bufpath or bufpath == '' then return filepath end
+--- Listings by root and by the options that shape them
+---@type table<string, blink-cmp-fuzzy-path.Listing>
+M.listings = {}
 
-  local base_dir = search_base or vim.fn.getcwd()
-  base_dir = vim.fn.expand(base_dir)
-  base_dir = vim.fn.fnamemodify(base_dir, ':p')
-  if vim.endswith(base_dir, '/') then base_dir = base_dir:sub(1, -2) end
+--- Forget every listing, so the next completion reads the tree again
+function M.invalidate() M.listings = {} end
 
-  local buf_dir = vim.fn.fnamemodify(bufpath, ':h')
-  local abs_filepath = vim.fn.fnamemodify(filepath, ':p')
-
-  if not vim.startswith(filepath, '/') then
-    abs_filepath = vim.fn.fnamemodify(base_dir .. '/' .. filepath, ':p')
-  end
-
-  if vim.startswith(abs_filepath, buf_dir) then
-    local rel_path = vim.fn.fnamemodify(abs_filepath, ':.')
-    return rel_path
-  end
-
-  if vim.startswith(abs_filepath, base_dir .. '/') then
-    return abs_filepath:sub(#base_dir + 2)
-  end
-
-  return vim.fn.fnamemodify(abs_filepath, ':~:.')
-end
-
-local function list_all_files_async(config, callback)
-  local tool = config.search_tool
-  if tool ~= 'fd' and tool ~= 'rg' then
-    if command_exists('fd') then
-      tool = 'fd'
-    elseif command_exists('rg') then
-      tool = 'rg'
-    else
-      vim.notify(
-        "blink-cmp-fuzzy-path: Neither 'fd' nor 'rg' found.",
-        vim.log.levels.WARN
-      )
-      callback({})
-      return nil
+--- The listing command, `fd` (or Debian's `fdfind`) or `rg`, as configured
+--- when it is installed and the other one otherwise
+---@param config table
+---@return string[]? argv
+function M.command(config)
+  local tools = config.search_tool == 'rg' and { 'rg', 'fd', 'fdfind' }
+    or { 'fd', 'fdfind', 'rg' }
+  for _, tool in ipairs(tools) do
+    if vim.fn.executable(tool) == 1 then
+      local argv = { tool }
+      if tool == 'rg' then
+        vim.list_extend(argv, {
+          '--files',
+          '--max-depth',
+          tostring(config.max_depth),
+        })
+      else
+        vim.list_extend(argv, {
+          '--type',
+          'f',
+          '--max-depth',
+          tostring(config.max_depth),
+        })
+      end
+      if config.search_hidden then table.insert(argv, '--hidden') end
+      if not config.search_gitignore then table.insert(argv, '--no-ignore') end
+      return argv
     end
   end
+  return nil
+end
 
-  local args = {}
-  local cmd = tool
-
-  if tool == 'fd' then
-    args = { '--type', 'f', '-d', tostring(config.max_depth or 20) }
-    if config.search_hidden then table.insert(args, '--hidden') end
-    if not config.search_gitignore then table.insert(args, '--no-ignore') end
-  else
-    args = { '--files' }
-    if config.search_hidden then table.insert(args, '--hidden') end
-    if not config.search_gitignore then table.insert(args, '--no-ignore') end
+--- List the files under `root` in the background, at most `max_files`, and
+--- hand them to `on_done` on the main loop; a failed or timed-out listing
+--- hands over what it read before
+---@param root string
+---@param config table
+---@param on_done fun(files: string[], cut: boolean)
+---@return vim.SystemObj?
+function M.list(root, config, on_done)
+  local argv = M.command(config)
+  if not argv then
+    vim.notify(
+      "blink-cmp-fuzzy-path: Neither 'fd' nor 'rg' found.",
+      vim.log.levels.WARN
+    )
+    vim.schedule(function() on_done({}, false) end)
+    return nil
   end
 
-  local search_path = config.search_dir or vim.fn.getcwd()
-
-  local stdout = vim.loop.new_pipe(false)
-  local handle
-  local all_files = {}
-  local stdout_data = ''
-
-  handle = vim.loop.spawn(
-    cmd,
-    {
-      args = args,
-      stdio = { nil, stdout, nil },
-      cwd = search_path,
-    },
-    vim.schedule_wrap(function(code, signal)
-      if stdout and not stdout:is_closing() then stdout:close() end
-      if handle and not handle:is_closing() then handle:close() end
-
-      if stdout_data ~= '' then
-        for line in stdout_data:gmatch('([^\n]+)') do
-          if line ~= '' then
-            line = line:gsub([[^%./]], '')
-            table.insert(all_files, line)
+  local files, partial, cut, answered = {}, '', false, false
+  ---@type vim.SystemObj?
+  local process
+  local function answer()
+    if answered then return end
+    answered = true
+    vim.schedule(function() on_done(files, cut) end)
+  end
+  local started_ok, started = pcall(vim.system, argv, {
+    cwd = root,
+    text = true,
+    timeout = config.timeout,
+    stdout = function(_, data)
+      if not data or cut then return end
+      -- Lines are taken as they come: the output of a large tree is never
+      -- held whole, and the listing stops at `max_files`
+      local text = partial .. data
+      local last = 1
+      for line, next_at in text:gmatch('([^\n]*)\n()') do
+        last = next_at
+        if line ~= '' then
+          table.insert(files, (line:gsub('^%./', '')))
+          if #files >= config.max_files then
+            cut = true
+            if process then pcall(process.kill, process, 'sigterm') end
+            return
           end
         end
       end
-
-      callback(all_files)
-    end)
-  )
-
-  if not handle then
-    callback({})
+      partial = text:sub(last)
+    end,
+  }, function() answer() end)
+  if not started_ok then
+    vim.schedule(function() on_done({}, false) end)
     return nil
   end
-
-  stdout:read_start(vim.schedule_wrap(function(err, data)
-    if err then
-      callback({})
-      return
+  process = started
+  -- The exit is only reported once the output closes, and something the
+  -- tool started can hold it open past the deadline: give up on it then
+  local guard = assert(vim.uv.new_timer())
+  guard:start(config.timeout + 1000, 0, function()
+    guard:close()
+    if not answered then
+      pcall(started.kill, started, 'sigkill')
+      answer()
     end
-    if data then stdout_data = stdout_data .. data end
-  end))
-
-  return function()
-    if handle and not handle:is_closing() then handle:close() end
-    if stdout and not stdout:is_closing() then stdout:close() end
-  end
+  end)
+  return process
 end
 
-function M.search_files_async(query, config, bufpath, callback)
-  if not query or query == '' then
-    callback({})
-    return nil
+--- Hand `on_done` the files under `root`: from the listing kept while it
+--- is younger than `cache_ttl`, else from a new one, which every request
+--- made meanwhile waits for
+---@param root string
+---@param config table
+---@param on_done fun(files: string[])
+function M.files(root, config, on_done)
+  local key = table.concat({
+    root,
+    config.search_tool,
+    config.max_depth,
+    tostring(config.search_hidden),
+    tostring(config.search_gitignore),
+    config.max_files,
+  }, '\0')
+  local listing = M.listings[key]
+  if listing and not listing.done then
+    return table.insert(listing.waiting, on_done)
+  end
+  if listing and os.time() - listing.time < config.cache_ttl then
+    return on_done(listing.files)
   end
 
-  local cancel_fn = list_all_files_async(config, function(all_files)
-    local matches = {}
+  listing =
+    { files = {}, time = 0, cut = false, done = false, waiting = { on_done } }
+  M.listings[key] = listing
+  M.list(root, config, function(files, cut)
+    -- Forgotten meanwhile: the answer still goes to whoever waited for it
+    listing.files, listing.cut, listing.time = files, cut, os.time()
+    listing.done = true
+    local waiting = listing.waiting
+    listing.waiting = {}
+    for _, callback in ipairs(waiting) do
+      callback(files)
+    end
+  end)
+end
 
-    for _, file in ipairs(all_files) do
-      local score, exact = fuzzy_match(query, file)
-      if score then
-        table.insert(matches, { path = file, score = score, exact = exact })
+--- The `limit` best matches of `query` among `files`, best first
+---
+--- Kept in a short sorted list as they are found: a short query matches
+--- nearly every file of a large tree, and sorting all of them on every key
+--- is what held the editor up.
+---@param query string
+---@param files string[]
+---@param limit integer
+---@return string[]
+function M.best(query, files, limit)
+  ---@type { path: string, score: number, exact: boolean }[]
+  local best = {}
+  local function better(a, b)
+    if a.exact ~= b.exact then return a.exact end
+    if a.score ~= b.score then return a.score > b.score end
+    return #a.path < #b.path
+  end
+  for _, file in ipairs(files) do
+    local score, exact = fuzzy_match(query, file)
+    if score then
+      local entry = { path = file, score = score, exact = exact == true }
+      if #best < limit or better(entry, best[#best]) then
+        local at = #best + 1
+        while at > 1 and better(entry, best[at - 1]) do
+          at = at - 1
+        end
+        table.insert(best, at, entry)
+        if #best > limit then table.remove(best) end
       end
     end
+  end
+  return vim.tbl_map(function(entry) return entry.path end, best)
+end
 
-    table.sort(matches, function(a, b)
-      if a.exact and not b.exact then return true end
-      if b.exact and not a.exact then return false end
-      return a.score > b.score
-    end)
+--- `file`, listed relative to `root`, as it is inserted: relative to the
+--- working directory when it is under it, else from the home directory
+---@param file string
+---@param root string
+---@param config table
+---@return string
+function M.display(file, root, config)
+  local path = vim.fs.joinpath(root, file)
+  if not config.relative_paths then return path end
+  local cwd = vim.fs.normalize(vim.fn.getcwd())
+  if root == cwd then return file end
+  -- With the separator: `/x/proj` does not hold `/x/proj-other`
+  if vim.startswith(path, cwd .. '/') then return path:sub(#cwd + 2) end
+  return vim.fn.fnamemodify(path, ':~')
+end
 
-    local results = {}
-    for i = 1, math.min(#matches, config.max_results) do
-      table.insert(results, matches[i].path)
-    end
-
-    if config.relative_paths and bufpath then
-      local search_base = config.search_dir or vim.fn.getcwd()
-      results = vim.tbl_map(
-        function(file) return make_relative_path(file, bufpath, search_base) end,
+--- Search the files under the configured directory, or the working one,
+--- for `query`, and hand the best of them to `callback` on the main loop
+---@param query string
+---@param config table
+---@param callback fun(files: string[])
+---@return fun() cancel Drops the answer; the listing itself carries on, for
+--- the next request to use
+function M.search_files_async(query, config, _, callback)
+  if not query or query == '' then
+    callback({})
+    return function() end
+  end
+  local root = config.search_dir or vim.fs.normalize(vim.fn.getcwd())
+  local cancelled = false
+  M.files(root, config, function(files)
+    if cancelled then return end
+    local results = M.best(query, files, config.max_results)
+    callback(
+      vim.tbl_map(
+        function(file) return M.display(file, root, config) end,
         results
       )
-    end
-
-    callback(results)
+    )
   end)
-
-  return cancel_fn
+  return function() cancelled = true end
 end
 
 return M
